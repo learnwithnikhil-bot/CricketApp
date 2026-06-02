@@ -185,6 +185,7 @@ def init_session_state():
         'viewer_mode': False,  # True if this device is just watching, not scoring
         'last_save_time': 0.0,    # throttle: timestamp of last cloud save
         'pending_save': False,    # something changed but isn't saved yet
+        'pending_no_ball': False, # waiting for user to pick runs off no ball
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -275,11 +276,11 @@ def generate_scorecard_image(t1, t2, result_text, total_overs):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
-    f_title = _load_font(72, bold=True)
+    f_title = _load_font(100, bold=True)
     f_score = _load_font(148, bold=True)
-    f_overs = _load_font(42)
-    f_label = _load_font(30, bold=True)
-    f_foot = _load_font(30)
+    f_overs = _load_font(52)
+    f_label = _load_font(44, bold=True)
+    f_foot = _load_font(38)
 
     M = 60
 
@@ -300,15 +301,15 @@ def generate_scorecard_image(t1, t2, result_text, total_overs):
 
 
     CARD_H = 330
-    GAP = 46
+    GAP = 36
     BANNER_H = 160
-    title_h = 88
-    block = title_h + 44 + CARD_H + GAP + CARD_H + 64 + BANNER_H
+    title_h = 120
+    block = title_h + 36 + CARD_H + GAP + CARD_H + 56 + BANNER_H
     y = (H - block) // 2
 
 
     center("MATCH RESULT", f_title, y, ACCENT)
-    y += title_h + 44
+    y += title_h + 36
 
     pad = 56
     xr = M + 560
@@ -317,32 +318,32 @@ def generate_scorecard_image(t1, t2, result_text, total_overs):
 
     def card(score, top):
         d.rounded_rectangle([M, top, W - M, top + CARD_H], radius=30, fill=CARD)
-        d.text((M + pad, top + 36), score['team'],
-               font=_fit(score['team'], 72, team_max_w), fill=WHITE)
-        d.text((M + pad, top + 128), f"{score['runs']}/{score['wickets']}",
+        d.text((M + pad, top + 32), score['team'],
+               font=_fit(score['team'], 88, team_max_w), fill=WHITE)
+        d.text((M + pad, top + 130), f"{score['runs']}/{score['wickets']}",
                font=f_score, fill=GOLD)
-        d.text((M + pad, top + 288), f"{score['overs']} / {total_overs} overs",
+        d.text((M + pad, top + 290), f"{score['overs']} / {total_overs} overs",
                font=f_overs, fill=MUTED)
         tb = _top_batter(score.get('batsmen_stats', {}))
         tw = _top_bowler(score.get('bowlers_stats', {}))
-        
+
         if tb:
             n, s = tb
             txt = f"{n}  {s.get('runs', 0)} ({s.get('balls', 0)})"
-            d.text((xr, top + 50), "TOP SCORER", font=f_label, fill=MUTED)
-            d.text((xr, top + 90), txt, font=_fit(txt, 46, stat_max_w), fill=WHITE)
+            d.text((xr, top + 40), "TOP SCORER", font=f_label, fill=MUTED)
+            d.text((xr, top + 100), txt, font=_fit(txt, 56, stat_max_w), fill=WHITE)
         if tw:
             n, s = tw
             bl = s.get('balls', 0)
             ov = f"{bl // 6}.{bl % 6}"
             txt = f"{n}  {s.get('wickets', 0)}/{s.get('runs', 0)} ({ov})"
-            d.text((xr, top + 186), "BEST BOWLER", font=f_label, fill=MUTED)
-            d.text((xr, top + 226), txt, font=_fit(txt, 46, stat_max_w), fill=WHITE)
+            d.text((xr, top + 184), "BEST BOWLER", font=f_label, fill=MUTED)
+            d.text((xr, top + 244), txt, font=_fit(txt, 56, stat_max_w), fill=WHITE)
 
     card(t1, y)
     y += CARD_H + GAP
     card(t2, y)
-    y += CARD_H + 64
+    y += CARD_H + 56
 
     d.rounded_rectangle([M, y, W - M, y + BANNER_H], radius=30, fill=ACCENT)
     rf = _fit(result_text, 62, (W - 2 * M) - 60)
@@ -401,9 +402,9 @@ def add_ball(runs_scored, is_wicket=False, extra_type=None):
         st.session_state.consecutive_wides += 1
         runs_scored = 1 if st.session_state.consecutive_wides % 2 == 0 else 0
     elif extra_type == 'No Ball':
-        runs_scored = 0
+        # Batter can score off a no ball — caller passes the bat runs.
+        st.session_state.consecutive_wides = 0
     else:
-
         st.session_state.consecutive_wides = 0
 
     ball_data = {
@@ -434,7 +435,8 @@ def add_ball(runs_scored, is_wicket=False, extra_type=None):
     if striker and striker in st.session_state.batsmen_stats:
         if extra_type not in ['Wide', 'No Ball']:
             st.session_state.batsmen_stats[striker]['balls'] += 1
-        if extra_type is None:
+        if extra_type is None or extra_type == 'No Ball':
+            # Credit batter for normal runs OR runs scored off a no ball.
             st.session_state.batsmen_stats[striker]['runs'] += runs_scored
             if runs_scored == 4:
                 st.session_state.batsmen_stats[striker]['fours'] += 1
@@ -608,7 +610,7 @@ def end_match():
 
 
 def reset_match():
-    """Reset the entire match"""
+    """Reset the entire match"""x
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     init_session_state()
@@ -1252,6 +1254,25 @@ elif st.session_state.setup_step == 'playing':
     # Scoring buttons (hidden in viewer mode)
     if (not st.session_state.awaiting_new_batsman
             and not st.session_state.awaiting_new_bowler
+            and not st.session_state.get('viewer_mode')
+            and st.session_state.get('pending_no_ball')):
+        # ===== NO BALL: pick bat runs =====
+        st.warning("⚾ **No Ball!** How many runs off the bat?")
+        nb_cols = st.columns(7)
+        for i, runs in enumerate([0, 1, 2, 3, 4, 5, 6]):
+            with nb_cols[i]:
+                label = f"NB + {runs}"
+                if st.button(label, key=f"nb_runs_{runs}"):
+                    st.session_state.pending_no_ball = False
+                    add_ball(runs, extra_type='No Ball')
+                    auto_save()
+                    st.rerun()
+        if st.button("❌ Cancel No Ball"):
+            st.session_state.pending_no_ball = False
+            st.rerun()
+
+    elif (not st.session_state.awaiting_new_batsman
+            and not st.session_state.awaiting_new_bowler
             and not st.session_state.get('viewer_mode')):
         st.subheader("📝 Add Score")
 
@@ -1285,8 +1306,7 @@ elif st.session_state.setup_step == 'playing':
                 st.rerun()
         with col3:
             if st.button("No Ball"):
-                add_ball(0, extra_type='No Ball')
-                auto_save()
+                st.session_state.pending_no_ball = True
                 st.rerun()
         with col4:
             if st.button("↩️ UNDO"):

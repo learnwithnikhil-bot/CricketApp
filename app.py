@@ -610,7 +610,7 @@ def end_match():
 
 
 def reset_match():
-    """Reset the entire match"""x
+    """Reset the entire match"""
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     init_session_state()

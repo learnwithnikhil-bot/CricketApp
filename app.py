@@ -186,6 +186,8 @@ def init_session_state():
         'last_save_time': 0.0,    # throttle: timestamp of last cloud save
         'pending_save': False,    # something changed but isn't saved yet
         'pending_no_ball': False, # waiting for user to pick runs off no ball
+        'celebrated_milestones': [],  # list of "bat:Player:50" / "bowl:Player:3" strings
+        'pending_celebration': None,  # message to show on next render
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -260,7 +262,7 @@ def _top_bowler(bowlers_stats):
     return name, bowlers_stats[name]
 
 
-def generate_scorecard_image(t1, t2, result_text, total_overs):
+def generate_scorecard_image(t1, t2, result_text, total_overs, mom=None):
     """Build a shareable PNG scorecard. Returns PNG bytes.
 
     Big bold scores, content auto-fit so nothing overflows, vertically
@@ -351,6 +353,17 @@ def generate_scorecard_image(t1, t2, result_text, total_overs):
     th = bb[3] - bb[1]
     center(result_text, rf, y + (BANNER_H - th) // 2 - bb[1], WHITE)
 
+    # Player of the Match strip (gold)
+    if mom:
+        y += BANNER_H + 18
+        MOM_H = 90
+        d.rounded_rectangle([M, y, W - M, y + MOM_H], radius=20, fill=GOLD)
+        mom_text = f"🏆 Player of the Match: {mom['name']}"
+        mf = _fit(mom_text, 44, (W - 2 * M) - 60, bold=True)
+        bb = d.textbbox((0, 0), mom_text, font=mf)
+        th = bb[3] - bb[1]
+        center(mom_text, mf, y + (MOM_H - th) // 2 - bb[1], (15, 32, 39))
+
     center("Free Cricket Score App  -  built by Nikhil", f_foot, H - 46, MUTED)
 
     buf = io.BytesIO()
@@ -397,6 +410,11 @@ def init_bowler_stats(player_name):
 def add_ball(runs_scored, is_wicket=False, extra_type=None):
     """Add a ball to the game"""
 
+    # Snapshot for milestone detection
+    _striker_before = st.session_state.striker
+    _bowler_before = st.session_state.current_bowler
+    _prev_bat_runs = st.session_state.batsmen_stats.get(_striker_before, {}).get('runs', 0) if _striker_before else 0
+    _prev_bowl_wkts = st.session_state.bowlers_stats.get(_bowler_before, {}).get('wickets', 0) if _bowler_before else 0
 
     if extra_type == 'Wide':
         st.session_state.consecutive_wides += 1
@@ -496,6 +514,13 @@ def add_ball(runs_scored, is_wicket=False, extra_type=None):
             st.session_state.runs >= st.session_state.target):
         end_match()
 
+    # Detect milestones after all stats are updated
+    new_bat_runs = st.session_state.batsmen_stats.get(_striker_before, {}).get('runs', 0) if _striker_before else 0
+    new_bowl_wkts = st.session_state.bowlers_stats.get(_bowler_before, {}).get('wickets', 0) if _bowler_before else 0
+    msg = check_milestone(_prev_bat_runs, new_bat_runs, _prev_bowl_wkts, new_bowl_wkts,
+                          _striker_before, _bowler_before)
+    if msg:
+        st.session_state.pending_celebration = msg
 
 def undo_last_ball():
     """Undo the last recorded ball"""
@@ -625,6 +650,7 @@ SAVE_KEYS = [
     'batsmen_stats', 'next_batsman_index', 'awaiting_new_batsman',
     'current_bowler', 'bowlers_stats', 'awaiting_new_bowler', 'over_runs',
     'consecutive_wides', 'toss_winner', 'toss_decision', 'toss_done',
+    'celebrated_milestones', 'pending_celebration',
 ]
 
 
@@ -692,6 +718,89 @@ def auto_save(force=False):
         if ok:
             st.session_state.last_save_time = now
             st.session_state.pending_save = False
+
+# ===== MILESTONE CELEBRATIONS =====
+BATTER_MILESTONES = [50, 100]
+BOWLER_MILESTONES = [5]
+
+BATTER_LABELS = {50: "🌟 FIFTY for ", 100: "💯 CENTURY for "}
+BOWLER_LABELS = {5: "🌟 FIFER for "}
+
+
+def check_milestone(prev_runs, new_runs, prev_wkts, new_wkts, striker, bowler):
+    """Detect newly-crossed milestones. Marks them celebrated and returns a
+    user-facing message (or None)."""
+    celebrated = set(st.session_state.get('celebrated_milestones', []))
+
+    # Batter milestones
+    if striker:
+        for m in BATTER_MILESTONES:
+            if prev_runs < m <= new_runs:
+                key = f"bat:{striker}:{m}"
+                if key not in celebrated:
+                    celebrated.add(key)
+                    st.session_state.celebrated_milestones = list(celebrated)
+                    return BATTER_LABELS[m] + striker + "!"
+
+    # Bowler milestones
+    if bowler:
+        for m in BOWLER_MILESTONES:
+            if prev_wkts < m <= new_wkts:
+                key = f"bowl:{bowler}:{m}"
+                if key not in celebrated:
+                    celebrated.add(key)
+                    st.session_state.celebrated_milestones = list(celebrated)
+                    return BOWLER_LABELS[m] + bowler + "!"
+    return None
+
+def calculate_player_of_match(t1, t2):
+    """Pick MoM from both teams using a balanced formula:
+    score = runs + (wickets * 20) + (fours * 2) + (sixes * 4)
+    Returns (name, team, score_dict) or None."""
+    candidates = []
+
+    for innings_score in [t1, t2]:
+        team = innings_score.get('team', '')
+        bowling_team = innings_score.get('bowling_team', '')
+        bat_stats = innings_score.get('batsmen_stats', {}) or {}
+        bowl_stats = innings_score.get('bowlers_stats', {}) or {}
+
+        # Combine: a player might bat for team A and bowl for team A too in some formats,
+        # but normally batters are on one team and bowlers on the other.
+        all_players = {}
+        for name, s in bat_stats.items():
+            all_players[name] = {'team': team, 'runs': s.get('runs', 0),
+                                 'balls': s.get('balls', 0),
+                                 'fours': s.get('fours', 0),
+                                 'sixes': s.get('sixes', 0),
+                                 'wickets': 0}
+        for name, s in bowl_stats.items():
+            # Bowlers belong to the bowling_team for THIS innings
+            if name not in all_players:
+                all_players[name] = {'team': bowling_team, 'runs': 0, 'balls': 0,
+                                     'fours': 0, 'sixes': 0, 'wickets': 0}
+            all_players[name]['wickets'] = s.get('wickets', 0)
+            # If this player also batted for the OTHER team, keep that team
+            if name in bat_stats:
+                pass  # team already set to batting team
+            else:
+                all_players[name]['team'] = bowling_team
+
+        for name, info in all_players.items():
+            score = (info['runs']
+                     + info['wickets'] * 20
+                     + info['fours'] * 2
+                     + info['sixes'] * 4)
+            candidates.append((score, name, info))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    score, name, info = candidates[0]
+    return {'name': name, 'team': info['team'], 'score': score,
+            'runs': info['runs'], 'balls': info['balls'],
+            'wickets': info['wickets'], 'fours': info['fours'], 'sixes': info['sixes']}
+
 
 def get_current_over_balls():
     """Return the deliveries belonging to the current (or just-completed) over."""
@@ -985,12 +1094,15 @@ elif st.session_state.match_complete:
         result_text = "Match Tied!"
         st.warning(f"🤝 **{result_text}**")
 
+    # Calculate Player of the Match (needed for both the image and the card below)
+    mom = calculate_player_of_match(t1, t2)
+
     # ===== SHAREABLE SCORECARD IMAGE =====
     st.markdown("---")
     st.subheader("📸 Share this result")
     try:
         img_bytes = generate_scorecard_image(
-            t1, t2, result_text, st.session_state.total_overs
+            t1, t2, result_text, st.session_state.total_overs, mom=mom
         )
         st.image(img_bytes, caption="Your shareable scorecard", width=400)
         st.download_button(
@@ -1041,6 +1153,27 @@ elif st.session_state.match_complete:
             st.info("No bowling stats recorded")
 
         st.markdown("---")
+
+    # ===== PLAYER OF THE MATCH =====
+    if mom:
+        st.markdown("---")
+        contrib_parts = []
+        if mom['runs'] > 0:
+            contrib_parts.append(f"{mom['runs']} runs ({mom['balls']} balls)")
+        if mom['wickets'] > 0:
+            contrib_parts.append(f"{mom['wickets']} wickets")
+        contrib = " &nbsp;·&nbsp; ".join(contrib_parts) if contrib_parts else "All-round contribution"
+
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #d4af37, #ffd54f, #d4af37);
+                    border-radius: 16px; padding: 28px; text-align: center;
+                    color: #0f2027; margin: 20px 0; box-shadow: 0 6px 24px rgba(0,0,0,0.4);">
+            <div style="font-size: 1.1rem; font-weight: 700; letter-spacing: 2px;">🏆 PLAYER OF THE MATCH</div>
+            <div style="font-size: 2.6rem; font-weight: 900; margin: 8px 0;">{mom['name']}</div>
+            <div style="font-size: 1.1rem; opacity: 0.85;">{mom['team']}</div>
+            <div style="font-size: 1.2rem; font-weight: 600; margin-top: 12px;">{contrib}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     if st.button("🆕 Start New Match", type="primary"):
         reset_match()
@@ -1160,6 +1293,13 @@ elif st.session_state.setup_step == 'playing':
     tracker_html = render_over_tracker()
     if tracker_html:
         st.markdown(tracker_html, unsafe_allow_html=True)
+
+    # ===== MILESTONE CELEBRATION =====
+    if st.session_state.get('pending_celebration'):
+        msg = st.session_state.pending_celebration
+        st.balloons()
+        st.success(f"### {msg}")
+        st.session_state.pending_celebration = None  # only show once
 
     # ===== CURRENT BOWLER =====
     st.subheader("⚾ Current Bowler")
